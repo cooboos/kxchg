@@ -1,0 +1,461 @@
+Index: kernel/Makefile
+===================================================================
+--- kernel/Makefile	(revision 6603)
++++ kernel/Makefile	(working copy)
+@@ -76,6 +76,7 @@
+ obj-$(CONFIG_AUDIT_TREE) += audit_tree.o
+ obj-$(CONFIG_GCOV_KERNEL) += gcov/
+ obj-$(CONFIG_KPROBES) += kprobes.o
++obj-y                 += kxchg.o
+ obj-$(CONFIG_KGDB) += debug/
+ obj-$(CONFIG_DETECT_HUNG_TASK) += hung_task.o
+ obj-$(CONFIG_LOCKUP_DETECTOR) += watchdog.o
+Index: kernel/kxchg.c
+===================================================================
+--- kernel/kxchg.c	(revision 0)
++++ kernel/kxchg.c	(revision 0)
+@@ -0,0 +1,183 @@
++/*
++ * wangsongbo  <hack.coo@gmail.com>, 2012
++ *
++ * Released under the terms of the GNU GPL v2.0
++ *
++ * version 1.0 for Linux-2.6.38
++ */
++/*
++ * trap int3 instruction
++ */
++#include <linux/kprobes.h>
++#include <linux/hash.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/stddef.h>
++#include <linux/module.h>
++#include <linux/moduleloader.h>
++#include <linux/kallsyms.h>
++#include <linux/freezer.h>
++#include <linux/seq_file.h>
++#include <linux/debugfs.h>
++#include <linux/kdebug.h>
++#include <linux/kxchg.h>
++#include <linux/notifier.h>	 
++#include <linux/ptrace.h>
++
++unsigned long kallsyms_lookup_name(const char *name);
++extern void arch_trap_kxchg(struct kxchg *p);
++extern void arch_saveins(struct kxchg *p);
++extern int kxchg_notifier_process(struct notifier_block *self, unsigned long val, void *data);
++struct kxchg_list kxchg_head;
++struct kxchg_list kxchg_old;
++
++static int kxchg_addr(struct kxchg *p)
++{
++	if (p && p->symbol_name && p->symbol_name_rep) {
++
++		p->addr = kallsyms_lookup_name(p->symbol_name);
++		if(!p->addr)
++			return 1;
++
++		p->addr_rep = kallsyms_lookup_name(p->symbol_name_rep);
++		if(!p->addr_rep)
++			return 1;
++	}
++
++	return 0;
++}
++
++int get_kxchg(struct kxchg *kxchg)
++{
++	int found = 0;
++	struct list_head *plist, *tmp;
++	struct kxchg *pkxchg = NULL;
++
++	//Fixme: rcu read lock
++	spin_lock(&kxchg_head.lock);
++	list_for_each_safe(plist, tmp, &kxchg_head.list) {
++		pkxchg = list_entry(plist, struct kxchg, list);
++		if(pkxchg->addr == kxchg->addr) {
++			/*
++			 * this symbol already resitered 
++			 *	one symbole is only registered once
++			 */
++			found = 1;
++			list_del(&pkxchg->list);
++		}
++	}
++	spin_unlock(&kxchg_head.lock);
++	//Fixme:rcu read unlock
++
++	if (found) {
++	
++		//Fixme: rcu write lock
++		spin_lock(&kxchg_old.lock);
++		list_add(&pkxchg->list, &kxchg_old.list);
++		spin_unlock(&kxchg_old.lock);
++		//Fixme: rcu write unlock
++	}
++
++	return 0;
++}
++int kxchg_register(struct kxchg *ptr)
++{
++	int ret;
++	/*
++	 * address the original symbol 
++	 *  and the replace symbol 
++	 */	
++	ret = kxchg_addr(ptr);
++	if(ret) {
++
++		printk("kxchg get addr error!\n");
++		return 1;
++	}
++
++	printk("symbol [%s] address [%lx] new replace symbol_add[%lx]\n",ptr->symbol_name, ptr->addr, ptr->addr_rep);
++
++	ret = get_kxchg(ptr);
++	if(ret){
++		printk("old [%s] also exist\n",ptr->symbol_name);
++		return 1;
++	}
++
++	//Fixme: rcu write lock
++	spin_lock(&kxchg_head.lock);
++	list_add(&ptr->list, &kxchg_head.list);
++	spin_unlock(&kxchg_head.lock);
++	//Fixme: rcu write unlock
++
++	/*
++	 *save the instruction the original symbol address pointed to
++	 */
++	printk("arch save ins...\n");
++	arch_saveins(ptr);
++	/*
++	 *replace the instruction by 0xcc,x86 for example;
++	 */
++	printk("arch trap kxchg...\n");
++	arch_trap_kxchg(ptr);
++	//sync_core();
++	
++	return 0;
++}
++int kxchg_unregister(struct kxchg *kxchg)
++{
++	int found = 0;
++	struct list_head *pos, *n;
++	struct kxchg *pos_k;
++
++	spin_lock(&kxchg_head.lock);
++	list_for_each_safe(pos, n, &kxchg_head.list){
++		pos_k = list_entry(pos, struct kxchg, list);
++		if(pos_k && !memcmp(pos_k->symbol_name, kxchg->symbol_name, 128)) {
++
++			memcpy((void *)kxchg->addr_rep, (void *)kxchg->ori_ins, 1);
++			list_del(pos);
++			found = 1;
++			break;
++		}
++	}
++	spin_lock(&kxchg_head.lock);
++
++
++	if(!found) {
++		spin_lock(&kxchg_old.lock);
++		list_for_each_safe(pos, n, &kxchg_old.list){
++			pos_k = list_entry(pos, struct kxchg, list);
++			if(pos_k && !memcmp(pos_k->symbol_name, kxchg->symbol_name, 128)) {
++
++				memcpy((void *)kxchg->addr_rep, (void *)kxchg->ori_ins, 1);
++				list_del(pos);
++				break;
++			}
++		}
++		spin_unlock(&kxchg_old.lock);
++	}
++
++
++	return 0;
++}
++struct notifier_block kxchg_notifier_block = {
++	.notifier_call = kxchg_notifier_process,
++	.priority = 0x7fffffff
++};
++
++static int __init init_kxchg(void)
++{
++	INIT_LIST_HEAD(&kxchg_head.list);
++	spin_lock_init(&kxchg_head.lock);
++
++	INIT_LIST_HEAD(&kxchg_old.list);
++	spin_lock_init(&kxchg_old.lock);
++
++	register_die_notifier(&kxchg_notifier_block);
++	return 0;
++}
++
++module_init(init_kxchg);
++
++EXPORT_SYMBOL_GPL(kxchg_register);
++EXPORT_SYMBOL_GPL(kxchg_unregister);
++
+Index: Documentation/kxchg.txt
+===================================================================
+--- Documentation/kxchg.txt	(revision 0)
++++ Documentation/kxchg.txt	(revision 0)
+@@ -0,0 +1,47 @@
++example:
++
++#include <linux/types.h>
++#include <linux/init.h>
++#include <linux/string.h>
++#include <linux/in.h>
++#include <linux/types.h>
++#include <linux/list.h>
++#include <linux/kxchg.h>
++
++
++static struct kxchg test;
++extern int kxchg_register(struct kxchg *ptr);
++extern int kxchg_unregister(struct kxchg *kxchg);
++
++int netif_receiver_skb(struct sk_buff *skb)
++{
++	printk("netif_receive_skb replace ... ok");
++	kfree_skb(skb);
++	return 0;
++}
++
++int __init test_init(void)
++{
++	memset(&test, 0x00, sizeof(test));
++
++	test.symbol_name="do_rule_add";
++	test.symbol_name_rep="do_rule_add_test";
++
++	kxchg_register(&test);
++	return 0;
++}
++
++void __exit test_exit(void)
++{
++
++	kxchg_unregister(&test);
++	return;
++}
++
++module_init(test_init);
++module_exit(test_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("cooboos");
++
++
+Index: arch/x86/kernel/Makefile
+===================================================================
+--- arch/x86/kernel/Makefile	(revision 6603)
++++ arch/x86/kernel/Makefile	(working copy)
+@@ -80,6 +80,7 @@
+ obj-$(CONFIG_KEXEC)		+= relocate_kernel_$(BITS).o crash.o
+ obj-$(CONFIG_CRASH_DUMP)	+= crash_dump_$(BITS).o
+ obj-$(CONFIG_KPROBES)		+= kprobes.o
++obj-y				+= kxchg.o
+ obj-$(CONFIG_MODULES)		+= module.o
+ obj-$(CONFIG_DOUBLEFAULT) 	+= doublefault_32.o
+ obj-$(CONFIG_KGDB)		+= kgdb.o
+Index: arch/x86/kernel/kxchg.c
+===================================================================
+--- arch/x86/kernel/kxchg.c	(revision 0)
++++ arch/x86/kernel/kxchg.c	(revision 0)
+@@ -0,0 +1,98 @@
++/*
++ * wangsongbo  <hack.coo@gmail.com>, 2012
++ *
++ * Released under the terms of the GNU GPL v2.0
++ *
++ * version 1.0 for Linux-2.6.38
++ */
++
++#include <linux/ptrace.h>
++#include <linux/kdebug.h>
++#include <linux/kxchg.h>
++#include <asm/kxchg.h>
++#include <asm/kdebug.h>
++#include <asm/ptrace.h>
++
++extern struct kxchg_list kxchg_head;
++int kxchg_notifier_process(struct notifier_block *self, unsigned long val, void *data)
++{
++	struct list_head *pos;
++	struct kxchg *kxchg;
++	struct die_args *args = (struct die_args *)data;
++	int ret = NOTIFY_DONE;
++
++	printk("kxchg_notifier_process...\n");
++	
++	if (args->regs && user_mode_vm(args->regs))
++		return ret;
++
++	
++	switch(val){
++		case DIE_INT3:
++			/*
++			 * the size of cc instruction is 1
++			 * ip--;
++			 */
++			printk("DIE_INT3...\n");
++			preempt_disable();
++			
++			args->regs->ip = args->regs->ip - 1;
++			spin_lock(&kxchg_head.lock);
++			printk("list for each kxchg_head ...\n");
++			list_for_each(pos, &kxchg_head.list){
++				kxchg = list_entry(pos, struct kxchg, list);
++				if(kxchg->addr == args->regs->ip){
++					/*
++					 * single step 
++					 */
++					printk("[%s][%d] regs ip [%lx]\n",__FUNCTION__,__LINE__,args->regs->ip);
++					args->regs->flags |= TF_MASK;
++					args->regs->ip = kxchg->addr_rep;
++
++					spin_unlock(&kxchg_head.lock);
++					return NOTIFY_STOP;
++				}
++			}
++			spin_unlock(&kxchg_head.lock);
++			/*
++			 * if the int3 instruction is not from kxchg_register, may be from other debuger
++			 * restore the original ip
++			 */
++			args->regs->ip = args->regs->ip + 1;
++			printk("no search regs ip [%lx]\n", args->regs->ip);
++			preempt_enable_no_resched();
++			return NOTIFY_DONE;
++		case DIE_DEBUG:
++			args->regs->flags &= ~TF_MASK;
++			printk("DIE_DEBUG in\n");
++			break;
++		default:
++			printk("no val[%ld] process\n",val);
++			goto nokxchg;
++	}
++	return NOTIFY_STOP;
++nokxchg:
++	return 0;
++}
++
++void arch_trap_kxchg(struct kxchg *p)
++{
++	memcpy((void *)(p->addr), ((unsigned char []){INT3_INSTRUCTION}), 1);
++	//text_poke(p->addr, ((unsigned char []){BREAKPOINT_INSTRUCTION}), 1);
++	//text_poke((unsigned char [])(p->addr), ((unsigned char []){INT3_INSTRUCTION}), 1);
++
++	printk("[%s][%d] p addr [%lx]\n",__FILE__, __LINE__, p->addr);
++	return;
++}
++
++void arch_saveins(struct kxchg *p)
++{
++	printk("[%s][%d] p addr [%lx]\n",__FILE__, __LINE__, p->addr);
++	memcpy((void *)&p->ori_ins, (void *)&p->addr, 1);
++	return;
++}
++void arch_restore_ins(struct kxchg *p)
++{
++	memcpy(&(p->addr), (void *)&p->ori_ins, 1);
++	return;
++}
+Index: arch/x86/kernel/traps.c
+===================================================================
+--- arch/x86/kernel/traps.c	(revision 6603)
++++ arch/x86/kernel/traps.c	(working copy)
+@@ -461,6 +461,14 @@
+ 			== NOTIFY_STOP)
+ 		return;
+ #endif /* CONFIG_KGDB_LOW_LEVEL_TRAP */
++
++#define CONFIG_KXCHG
++#ifdef CONFIG_KXCHG
++	if (notify_die(DIE_INT3, "int3", regs, error_code, 3, SIGTRAP)
++			== NOTIFY_STOP)
++		return;
++#endif
++
+ #ifdef CONFIG_KPROBES
+ 	if (notify_die(DIE_INT3, "int3", regs, error_code, 3, SIGTRAP)
+ 			== NOTIFY_STOP)
+Index: arch/x86/include/asm/kxchg.h
+===================================================================
+--- arch/x86/include/asm/kxchg.h	(revision 0)
++++ arch/x86/include/asm/kxchg.h	(revision 0)
+@@ -0,0 +1,9 @@
++/*
++ * wangsongbo  <hack.coo@gmail.com>, 2012
++ *
++ * Released under the terms of the GNU GPL v2.0
++ *
++ * version 1.0 for Linux-2.6.38
++ */
++#define INT3_INSTRUCTION 0xcc
++
+Index: include/linux/kxchg.h
+===================================================================
+--- include/linux/kxchg.h	(revision 0)
++++ include/linux/kxchg.h	(revision 0)
+@@ -0,0 +1,56 @@
++/*
++ * wangsongbo  <hack.coo@gmail.com>, 2012
++ *
++ * Released under the terms of the GNU GPL v2.0
++ *
++ * version 1.0 for Linux-2.6.38
++ */
++
++#define KXCHG_NAME_LEN 128
++#define TRAP_INT3_INSTRUCTION 0xcc
++
++#define TF_MASK		0x00000100
++#define IF_MASK		0x00000200
++#define IOPL_MASK	0x00003000
++#define NT_MASK		0x00004000
++
++#ifdef CONFIG_VM86
++
++#define VM_MASK		0x00020000
++
++#else
++
++#define VM_MASK		0 /* ignored */
++
++#endif
++
++#define AC_MASK		0x00040000
++#define VIF_MASK	0x00080000	/* virtual interrupt flag */
++#define VIP_MASK	0x00100000	/* virtual interrupt pending */
++#define ID_MASK		0x00200000
++
++/*
++ *the struct user need to register
++ */
++struct kxchg
++{
++	struct list_head list;
++
++	const char *symbol_name;
++	unsigned long addr;
++
++	const char *symbol_name_rep;
++	unsigned long addr_rep;
++
++	int ori_ins;
++};
++/*
++ *store the registered kxchg_struct in this list
++ */
++struct kxchg_list{
++	struct list_head list;
++	spinlock_t lock;
++};
++
++
++
