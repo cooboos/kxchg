@@ -1,2 +1,4 @@
-kxchg 20120918
+
+usage: patch -p0 < kxchg.patch.xxxxxxx
+
 kxchg.patch.20130204  for linux 2.6.38
